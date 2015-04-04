@@ -37,6 +37,7 @@
 #include <linux/rwsem.h>
 #include <linux/mfd/pm8xxx/misc.h>
 #include <linux/qpnp/qpnp-adc.h>
+#include <linux/pm_qos.h>
 
 #include <mach/board.h>
 #include <mach/msm_smd.h>
@@ -54,6 +55,10 @@
 #define CTRL_DEVICE "wcnss_ctrl"
 #define VERSION "1.01"
 #define WCNSS_PIL_DEVICE "wcnss"
+
+#define WCNSS_DISABLE_PC_LATENCY	100
+#define WCNSS_ENABLE_PC_LATENCY	PM_QOS_DEFAULT_VALUE
+#define WCNSS_PM_QOS_TIMEOUT	15000
 
 /* module params */
 #define WCNSS_CONFIG_UNSPECIFIED (-1)
@@ -157,6 +162,7 @@ static DEFINE_SPINLOCK(reg_spinlock);
 #define PRONTO_PLL_STATUS_OFFSET		0x1c
 
 #define MSM_PRONTO_MCU_BASE			0xfb080c00
+#define MCU_APB2PHY_STATUS_OFFSET		0xec
 #define MCU_CBR_CCAHB_ERR_OFFSET		0x380
 #define MCU_CBR_CAHB_ERR_OFFSET			0x384
 #define MCU_CBR_CCAHB_TIMEOUT_OFFSET		0x388
@@ -212,6 +218,7 @@ static DEFINE_SPINLOCK(reg_spinlock);
 #define	WCNSS_VBATT_LEVEL_IND         (WCNSS_CTRL_MSG_START + 8)
 #define	WCNSS_BUILD_VER_REQ           (WCNSS_CTRL_MSG_START + 9)
 #define	WCNSS_BUILD_VER_RSP           (WCNSS_CTRL_MSG_START + 10)
+#define	WCNSS_PM_CONFIG_REQ           (WCNSS_CTRL_MSG_START + 11)
 
 /* max 20mhz channel count */
 #define WCNSS_MAX_CH_NUM			45
@@ -251,10 +258,14 @@ static struct wcnss_pmic_dump wcnss_pmic_reg_dump[] = {
 	{"LVS1", 0x060},
 };
 
-#define NVBIN_FILE_X3    "wlan/prima/WCNSS_qcom_wlan_nv.bin"
-#define NVBIN_FILE_X4    "wlan/prima/WCNSS_qcom_wlan_nv_x4.bin"
-#define NVBIN_FILE_X4LTE "wlan/prima/WCNSS_qcom_wlan_nv_x4lte.bin"
-#define NVBIN_FILE_X5    "wlan/prima/WCNSS_qcom_wlan_nv_x5.bin"
+static int wcnss_notif_cb(struct notifier_block *this, unsigned long code,
+				void *ss_handle);
+
+static struct notifier_block wnb = {
+	.notifier_call = wcnss_notif_cb,
+};
+
+#define NVBIN_FILE "wlan/prima/WCNSS_qcom_wlan_nv.bin"
 
 /*
  * On SMD channel 4K of maximum data can be transferred, including message
@@ -382,6 +393,7 @@ static struct {
 	struct delayed_work wcnss_work;
 	struct delayed_work vbatt_work;
 	struct work_struct wcnssctrl_version_work;
+	struct work_struct wcnss_pm_config_work;
 	struct work_struct wcnssctrl_nvbin_dnld_work;
 	struct work_struct wcnssctrl_rx_work;
 	struct wake_lock wcnss_wake_lock;
@@ -423,6 +435,9 @@ static struct {
 	u16 unsafe_ch_list[WCNSS_MAX_CH_NUM];
 	void *wcnss_notif_hdle;
 	u8 is_shutdown;
+	struct pm_qos_request wcnss_pm_qos_request;
+	int pc_disabled;
+	struct delayed_work wcnss_pm_qos_del_req;
 } *penv = NULL;
 
 static ssize_t wcnss_wlan_macaddr_store(struct device *dev,
@@ -795,6 +810,10 @@ void wcnss_pronto_log_debug_regs(void)
 	reg = readl_relaxed(penv->wlan_tx_phy_aborts);
 	pr_err("WLAN_TX_PHY_ABORTS %08x\n", reg);
 
+	reg_addr = penv->pronto_mcu_base + MCU_APB2PHY_STATUS_OFFSET;
+	reg = readl_relaxed(reg_addr);
+	pr_err("MCU_APB2PHY_STATUS %08x\n", reg);
+
 	reg_addr = penv->pronto_mcu_base + MCU_CBR_CCAHB_ERR_OFFSET;
 	reg = readl_relaxed(reg_addr);
 	pr_err("MCU_CBR_CCAHB_ERR %08x\n", reg);
@@ -963,6 +982,46 @@ static void wcnss_remove_sysfs(struct device *dev)
 		device_remove_file(dev, &dev_attr_wcnss_mac_addr);
 	}
 }
+
+static void wcnss_pm_qos_add_request(void)
+{
+	pr_info("%s: add request", __func__);
+	pm_qos_add_request(&penv->wcnss_pm_qos_request, PM_QOS_CPU_DMA_LATENCY,
+			PM_QOS_DEFAULT_VALUE);
+}
+
+static void wcnss_pm_qos_remove_request(void)
+{
+	pr_info("%s: remove request", __func__);
+	pm_qos_remove_request(&penv->wcnss_pm_qos_request);
+}
+
+void wcnss_pm_qos_update_request(int val)
+{
+	pr_info("%s: update request %d", __func__, val);
+	pm_qos_update_request(&penv->wcnss_pm_qos_request, val);
+}
+
+void wcnss_disable_pc_remove_req(void)
+{
+	if (penv->pc_disabled) {
+		wcnss_pm_qos_update_request(WCNSS_ENABLE_PC_LATENCY);
+		wcnss_pm_qos_remove_request();
+		wcnss_allow_suspend();
+		penv->pc_disabled = 0;
+	}
+}
+
+void wcnss_disable_pc_add_req(void)
+{
+	if (!penv->pc_disabled) {
+		wcnss_pm_qos_add_request();
+		wcnss_prevent_suspend();
+		wcnss_pm_qos_update_request(WCNSS_DISABLE_PC_LATENCY);
+		penv->pc_disabled = 1;
+	}
+}
+
 static void wcnss_smd_notify_event(void *data, unsigned int event)
 {
 	int len = 0;
@@ -985,6 +1044,9 @@ static void wcnss_smd_notify_event(void *data, unsigned int event)
 		pr_debug("wcnss: opening WCNSS SMD channel :%s",
 				WCNSS_CTRL_CHANNEL);
 		schedule_work(&penv->wcnssctrl_version_work);
+		schedule_work(&penv->wcnss_pm_config_work);
+		__cancel_delayed_work(&penv->wcnss_pm_qos_del_req);
+		schedule_delayed_work(&penv->wcnss_pm_qos_del_req, 0);
 
 		break;
 
@@ -1152,6 +1214,13 @@ static struct platform_driver wcnss_ctrl_driver = {
 	.remove	= __devexit_p(wcnss_ctrl_remove),
 };
 
+void wcnss_get_monotonic_boottime(struct timespec *ts)
+{
+	get_monotonic_boottime(ts);
+}
+EXPORT_SYMBOL(wcnss_get_monotonic_boottime);
+
+
 struct device *wcnss_wlan_get_device(void)
 {
 	if (penv && penv->pdev && penv->smd_channel_ready)
@@ -1175,6 +1244,14 @@ struct wcnss_wlan_config *wcnss_get_wlan_config(void)
 	return NULL;
 }
 EXPORT_SYMBOL(wcnss_get_wlan_config);
+
+int wcnss_is_hw_pronto_ver3(void)
+{
+	if (penv && penv->pdev)
+		return penv->wlan_config.is_pronto_v3;
+	return 0;
+}
+EXPORT_SYMBOL(wcnss_is_hw_pronto_ver3);
 
 int wcnss_device_ready(void)
 {
@@ -1840,26 +1917,53 @@ static void wcnss_send_version_req(struct work_struct *worker)
 	return;
 }
 
-static DECLARE_RWSEM(wcnss_pm_sem);
-
-void wcnss_get_nv_file(char *nv_file, int size)
+static void wcnss_send_pm_config(struct work_struct *worker)
 {
-	int hw_ver;
+	struct smd_msg_hdr *hdr;
+	unsigned char *msg = NULL;
+	int rc, prop_len;
+	u32 *payload;
 
-	hw_ver = get_hw_version_major();
-	if (hw_ver == 4) {
-		/* X4 LTE P2 and later hw have version 4.5 and above */
-		if (get_hw_version_minor() >= 5)
-			strlcpy(nv_file, NVBIN_FILE_X4LTE, size);
-		else
-			strlcpy(nv_file, NVBIN_FILE_X4, size);
+	if (!of_find_property(penv->pdev->dev.of_node,
+				"qcom,wcnss-pm", &prop_len))
+		return;
+
+	msg = kmalloc((sizeof(struct smd_msg_hdr) + prop_len), GFP_KERNEL);
+
+	if (NULL == msg) {
+		pr_err("wcnss: %s: failed to allocate memory\n", __func__);
+		return;
 	}
-	else if (hw_ver == 5)
-		strlcpy(nv_file, NVBIN_FILE_X5, size);
-	else
-		strlcpy(nv_file, NVBIN_FILE_X3, size);
+
+	payload = (u32 *)(msg + sizeof(struct smd_msg_hdr));
+
+	prop_len /= sizeof(int);
+
+	rc = of_property_read_u32_array(penv->pdev->dev.of_node,
+			"qcom,wcnss-pm", payload, prop_len);
+	if (rc < 0) {
+		pr_err("wcnss: property read failed\n");
+		kfree(msg);
+		return;
+	}
+
+	pr_debug("%s:size=%d: <%d, %d, %d, %d, %d %d>\n", __func__,
+			prop_len, *payload, *(payload+1), *(payload+2),
+			*(payload+3), *(payload+4), *(payload+5));
+
+	hdr = (struct smd_msg_hdr *)msg;
+	hdr->msg_type = WCNSS_PM_CONFIG_REQ;
+	hdr->msg_len = sizeof(struct smd_msg_hdr) + (prop_len * sizeof(int));
+
+	rc = wcnss_smd_tx(msg, hdr->msg_len);
+	if (rc < 0)
+		pr_err("wcnss: smd tx failed\n");
+
+	kfree(msg);
+	return;
 }
-EXPORT_SYMBOL(wcnss_get_nv_file);
+
+static DECLARE_RWSEM(wcnss_pm_sem);
 
 static void wcnss_nvbin_dnld(void)
 {
@@ -1874,18 +1978,14 @@ static void wcnss_nvbin_dnld(void)
 	unsigned int nv_blob_size = 0;
 	const struct firmware *nv = NULL;
 	struct device *dev = &penv->pdev->dev;
-	char xiaomi_wlan_nv_file[40];
 
 	down_read(&wcnss_pm_sem);
 
-	wcnss_get_nv_file(xiaomi_wlan_nv_file, sizeof(xiaomi_wlan_nv_file));
-	pr_info("wcnss: Get nv file from %s\n", xiaomi_wlan_nv_file);
-
-	ret = request_firmware(&nv, xiaomi_wlan_nv_file, dev);
+	ret = request_firmware(&nv, NVBIN_FILE, dev);
 
 	if (ret || !nv || !nv->data || !nv->size) {
 		pr_err("wcnss: %s: request_firmware failed for %s\n",
-			__func__, xiaomi_wlan_nv_file);
+			__func__, NVBIN_FILE);
 		goto out;
 	}
 
@@ -1985,6 +2085,11 @@ out:
 	return;
 }
 
+static void wcnss_pm_qos_enable_pc(struct work_struct *worker)
+{
+	wcnss_disable_pc_remove_req();
+	return;
+}
 
 static void wcnss_caldata_dnld(const void *cal_data,
 		unsigned int cal_data_size, bool msg_to_follow)
@@ -2218,9 +2323,13 @@ wcnss_trigger_config(struct platform_device *pdev)
 	unsigned long wcnss_phys_addr;
 	int size = 0;
 	struct resource *res;
+	int is_pronto_v3;
 	int pil_retry = 0;
 	int has_pronto_hw = of_property_read_bool(pdev->dev.of_node,
 									"qcom,has-pronto-hw");
+
+	is_pronto_v3 = of_property_read_bool(pdev->dev.of_node,
+							"qcom,is-pronto-v3");
 
 	if (of_property_read_u32(pdev->dev.of_node,
 			"qcom,wlan-rx-buff-count", &penv->wlan_rx_buff_count)) {
@@ -2244,6 +2353,7 @@ wcnss_trigger_config(struct platform_device *pdev)
 	}
 	penv->wcnss_hw_type = (has_pronto_hw) ? WCNSS_PRONTO_HW : WCNSS_RIVA_HW;
 	penv->wlan_config.use_48mhz_xo = has_48mhz_xo;
+	penv->wlan_config.is_pronto_v3 = is_pronto_v3;
 
 	if (WCNSS_CONFIG_UNSPECIFIED == has_autodetect_xo && has_pronto_hw) {
 		has_autodetect_xo = of_property_read_bool(pdev->dev.of_node,
@@ -2297,9 +2407,13 @@ wcnss_trigger_config(struct platform_device *pdev)
 	}
 	INIT_WORK(&penv->wcnssctrl_rx_work, wcnssctrl_rx_handler);
 	INIT_WORK(&penv->wcnssctrl_version_work, wcnss_send_version_req);
+	INIT_WORK(&penv->wcnss_pm_config_work, wcnss_send_pm_config);
 	INIT_WORK(&penv->wcnssctrl_nvbin_dnld_work, wcnss_nvbin_dnld_main);
+	INIT_DELAYED_WORK(&penv->wcnss_pm_qos_del_req, wcnss_pm_qos_enable_pc);
 
 	wake_lock_init(&penv->wcnss_wake_lock, WAKE_LOCK_SUSPEND, "wcnss");
+	/* Add pm_qos request to disable power collapse for DDR */
+	wcnss_disable_pc_add_req();
 
 	if (wcnss_hardware_type() == WCNSS_PRONTO_HW) {
 		size = 0x3000;
@@ -2423,14 +2537,21 @@ wcnss_trigger_config(struct platform_device *pdev)
 		if (IS_ERR(penv->pil)) {
 			dev_err(&pdev->dev, "Peripheral Loader failed on WCNSS.\n");
 			ret = PTR_ERR(penv->pil);
+			wcnss_disable_pc_add_req();
 			wcnss_pronto_log_debug_regs();
 		}
 	} while (pil_retry++ < WCNSS_MAX_PIL_RETRY && IS_ERR(penv->pil));
 
 	if (pil_retry >= WCNSS_MAX_PIL_RETRY) {
+		wcnss_reset_intr();
+		if (penv->wcnss_notif_hdle)
+			subsys_notif_unregister_notifier(penv->wcnss_notif_hdle,
+				&wnb);
 		penv->pil = NULL;
 		goto fail_pil;
 	}
+	/* Remove pm_qos request */
+	wcnss_disable_pc_remove_req();
 
 	return 0;
 
@@ -2483,6 +2604,7 @@ fail_power:
 	else
 		wcnss_gpios_config(penv->gpios_5wire, false);
 fail_gpio_res:
+	wcnss_disable_pc_remove_req();
 	penv = NULL;
 	return ret;
 }
@@ -2609,22 +2731,21 @@ exit:
 static int wcnss_notif_cb(struct notifier_block *this, unsigned long code,
 				void *ss_handle)
 {
-	pr_debug("%s: wcnss notification event: %lu\n", __func__, code);
+	pr_info("%s: wcnss notification event: %lu\n", __func__, code);
 
-	if (SUBSYS_POWERUP_FAILURE == code)
-		wcnss_pronto_log_debug_regs();
-	else if (SUBSYS_BEFORE_SHUTDOWN == code)
-		penv->is_shutdown = 1;
-	else if (SUBSYS_AFTER_POWERUP == code)
-		penv->is_shutdown = 0;
+         if (code == SUBSYS_BEFORE_SHUTDOWN) {
+                 penv->is_shutdown = 1;
+                 wcnss_disable_pc_add_req();
+                 schedule_delayed_work(&penv->wcnss_pm_qos_del_req,
+                                 msecs_to_jiffies(WCNSS_PM_QOS_TIMEOUT));
+         } else if (code == SUBSYS_POWERUP_FAILURE) {
+                 wcnss_pronto_log_debug_regs();
+                 wcnss_disable_pc_remove_req();
+         } else if (SUBSYS_AFTER_POWERUP == code)
+                 penv->is_shutdown = 0;
 
 	return NOTIFY_DONE;
 }
-
-static struct notifier_block wnb = {
-	.notifier_call = wcnss_notif_cb,
-};
-
 
 static const struct file_operations wcnss_node_fops = {
 	.owner = THIS_MODULE,
